@@ -5790,11 +5790,23 @@ std::vector<Player*> GetBridgeVisibleBots(Player* player)
         for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
             AppendBridgeVisibleBot(it->second, bots, seen);
 
-    for (PlayerBotMap::const_iterator it = sRandomPlayerbotMgr.GetPlayerBotsBegin(); it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
+    // Scan group members instead of all random bots (O(group_size) vs O(all_bots))
+    if (Group* const group = player->GetGroup())
     {
-        Player* const bot = it->second;
-        if (CanExposeRandomHolderBot(player, bot))
-            AppendBridgeVisibleBot(bot, bots, seen);
+        for (GroupReference* ref = group->GetFirstMember(); ref != nullptr; ref = ref->next())
+        {
+            Player* const member = ref->GetSource();
+            if (!member || member == player)
+                continue;
+
+            if (!sPlayerbotsMgr.GetPlayerbotAI(member))
+                continue;
+
+            if (!sRandomPlayerbotMgr.IsRandomBot(member) && !sRandomPlayerbotMgr.IsAddclassBot(member))
+                continue;
+
+            AppendBridgeVisibleBot(member, bots, seen);
+        }
     }
 
     return bots;
