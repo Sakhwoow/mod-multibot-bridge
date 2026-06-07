@@ -13,6 +13,7 @@
 #include "ItemPackets.h"
 #include "ItemUsageValue.h"
 #include "LootObjectStack.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "PlayerbotAI.h"
@@ -5818,11 +5819,19 @@ Player* FindBotByName(Player* player, std::string const& botName)
     if (wantedName.empty())
         return nullptr;
 
-    for (Player* const bot : GetBridgeVisibleBots(player))
-    {
-        if (bot->GetName() == wantedName)
-            return bot;
-    }
+    Player* const bot = ObjectAccessor::FindPlayerByName(wantedName);
+    if (!bot || bot == player)
+        return nullptr;
+
+    // Check player-owned bots first
+    if (PlayerbotMgr* const mgr = sPlayerbotsMgr.GetPlayerbotMgr(player))
+        for (PlayerBotMap::const_iterator it = mgr->GetPlayerBotsBegin(); it != mgr->GetPlayerBotsEnd(); ++it)
+            if (it->second == bot)
+                return bot;
+
+    // Check random/holder bots
+    if (CanExposeRandomHolderBot(player, bot))
+        return bot;
 
     return nullptr;
 }
