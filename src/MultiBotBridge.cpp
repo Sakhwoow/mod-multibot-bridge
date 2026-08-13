@@ -5836,6 +5836,35 @@ Player* FindBotByName(Player* player, std::string const& botName)
     return nullptr;
 }
 
+bool ConsumeHeavyGetRateLimit(Player* requester, std::string const& handlerKey)
+{
+    if (!requester)
+        return false;
+
+    static std::map<std::string, std::chrono::steady_clock::time_point> lastRequests;
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName() + ":" + handlerKey;
+
+    auto const existing = lastRequests.find(key);
+    if (existing != lastRequests.end() && now - existing->second < std::chrono::seconds(30))
+        return false;
+
+    lastRequests[key] = now;
+
+    if (lastRequests.size() > 1024)
+    {
+        for (auto it = lastRequests.begin(); it != lastRequests.end();)
+        {
+            if (it->first != key && now - it->second >= std::chrono::seconds(120))
+                it = lastRequests.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
 bool ConsumeWeaponEnchantDebugRateLimit(Player* requester)
 {
     if (!requester)
@@ -6464,6 +6493,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             if (!IsValidRequestToken(fields[3]))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
+            if (!ConsumeHeavyGetRateLimit(player, "QUESTS"))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
+
             SendQuestPackets(player, replyType, fields[1], fields[2], fields[3]);
             return true;
         }
@@ -6496,6 +6528,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             if (!IsValidRequestToken(fields[2]))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
+            if (!ConsumeHeavyGetRateLimit(player, "GLYPHS"))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
+
             SendGlyphPackets(player, replyType, fields[1], fields[2]);
             return true;
         }
@@ -6507,6 +6542,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
             if (fields.size() == 2 && !IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_BOT_NAME");
+
+            if (!ConsumeHeavyGetRateLimit(player, requestType))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "TOO_MANY_REQUESTS");
 
             std::string const botName = fields.size() == 2 ? fields[1] : "";
             if (requestType == "PVP_STATS")
@@ -6563,7 +6601,11 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             else if (requestType == "BANK")
                 SendBankPackets(player, replyType, fields[1], fields[2]);
             else if (requestType == "GBANK")
+            {
+                if (!ConsumeHeavyGetRateLimit(player, "GBANK"))
+                    return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
                 SendGuildBankPackets(player, replyType, fields[1], fields[2]);
+            }
             else if (requestType == "SPELLBOOK")
                 SendSpellbookSnapshot(player, replyType, fields[1], fields[2]);
             else if (requestType == "BOT_SKILLS")
@@ -6595,6 +6637,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
             if (!IsValidRequestToken(fields[3]))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            if (!ConsumeHeavyGetRateLimit(player, "PROFESSION_RECIPES"))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
 
             SendProfessionRecipePackets(player, replyType, fields[1], fields[2], fields[3]);
             return true;
