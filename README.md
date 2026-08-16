@@ -331,7 +331,22 @@ Server -> Addon:  MBOT STRATEGY_ACK~<scope>~<target>~<token>~<stateScope>~<match
 
 Addon  -> Server: MBOT GET~WEAPON_ENCHANT~<botName>~<token>
 Server -> Addon:  MBOT WEAPON_ENCHANT~<token>~<botName>~<status>~<mhItem>~<mhEnchant>~<mhDuration>~<ohItem>~<ohEnchant>~<ohDuration>
+
+Addon  -> Server: MBOT RUN~GROUP_ROLL~<token>~NORMAL
+Addon  -> Server: MBOT RUN~GROUP_ROLL~<token>~ITEM~<encodedItemLink>
+Server -> Addon:  MBOT GROUP_ROLL_ACK~<token>~<status>~<mode>~<scope>~<matched>~<invoked>~<reason>
+
+Addon  -> Server: MBOT GET~ENCHANT_TRADE~<botName>~<token>
+Server -> Addon:  MBOT ENCHANT_TRADE_BEGIN~<botName>~<token>~<status>~<reason>~<skill>~<maxSkill>
+Server -> Addon:  MBOT ENCHANT_TRADE_ITEM~<botName>~<token>~<spellId>~<difficulty>~<available>~<hasTools>~<materialCount>
+Server -> Addon:  MBOT ENCHANT_TRADE_MATERIAL~<botName>~<token>~<spellId>~<materialIndex>~<itemId>~<required>~<available>
+Server -> Addon:  MBOT ENCHANT_TRADE_END~<botName>~<token>~<status>~<reason>~<count>
+
+Addon  -> Server: MBOT RUN~ENCHANT_TRADE~<botName>~<token>~<spellId>
+Server -> Addon:  MBOT ENCHANT_TRADE_RESULT~<botName>~<token>~<spellId>~<status>~<reason>~<accepted>
 ```
+
+Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
 
 The exact payloads are consumed internally by the MultiBot addon.
 
@@ -353,7 +368,12 @@ The bridge enforces the following input rules before any endpoint is called:
 - strict `%XX` field decoding;
 - rejection of control characters;
 - a maximum `ITEM_ACTION` count of 1000, while `0` keeps its existing
-  endpoint-specific meaning.
+  endpoint-specific meaning;
+- Group Roll item links are bounded to 160 characters and must contain a valid item-link marker before execution;
+- Group Roll requests are rate-limited per requester (4 requests per 2-second window in the current implementation), and execution is restricted to bridge-visible bots in the requester's actual party/raid with Playerbots security revalidation.
+- Enchant Trade list/run requests are rate-limited per requester (4 requests per 2-second window), require an exact controllable bot name and token, and accept only a positive numeric spell ID for execution.
+- Enchant Trade list framing declares a per-entry material count and 1-based material indexes; the addon rejects missing, duplicate or out-of-range material frames before caching a list.
+- Enchant Trade execution revalidates Playerbots security, active session/state, Enchanting skill, known active Enchanting spell identity, required tools/reagents, the exact current Trade partner and the requester's `TRADE_SLOT_NONTRADED` item before Core spell preparation.
 
 Malformed bridge requests are consumed and answered with:
 
@@ -442,8 +462,24 @@ should not be assumed to be generically fragmented by this capability.
     <td>Refresh available talent spec templates without automatic chat parsing.</td>
   </tr>
   <tr>
-    <td><code>GET~INVENTORY</code></td>
-    <td>Refresh inventory data with item links and icons.</td>
+    <td><code>GET~INVENTORY</code> / <code>INVENTORY_V1</code></td>
+    <td>Refresh inventory data natively through the bridge with item links and icons.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_ACTION</code> — <code>SELL_VENDOR</code> / <code>SELL_GREY</code></td>
+    <td>Run bounded bulk-sell actions after bot/security/rate-limit validation. <code>SELL_VENDOR</code> is the normal bridge-first Sell Vendor path; further SELL_GREY project work is explicitly deferred.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_ACTION</code> — <code>OPEN_ITEMS</code></td>
+    <td>Run the negotiated <code>INVENTORY_OPEN_V1</code> residual open-items path, revalidating session, controllability and the selected openable item before using the native open-item opcode.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~GROUP_ROLL</code> / <code>GROUP_ROLL_ACK</code></td>
+    <td>Run normal or item-linked group rolls through <code>GROUP_ROLL_V1</code>; execution is bounded to bridge-visible, controllable bots in the requester's actual party/raid and is rate-limited per requester.</td>
+  </tr>
+  <tr>
+    <td><code>GET~ENCHANT_TRADE</code> / <code>RUN~ENCHANT_TRADE</code></td>
+    <td>Expose and execute the negotiated <code>ENCHANT_TRADE_V1</code> Enchanting Trade Service. The bridge lists only known valid Enchanting spells and their material/tool availability, then executes one validated numeric spell ID against the requester's native non-traded Trade item.</td>
   </tr>
   <tr>
     <td><code>GET~BANK</code></td>
@@ -499,7 +535,7 @@ should not be assumed to be generically fragmented by this capability.
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code></td>
-    <td>Run whitelisted inventory item actions such as bank deposit, bank withdraw, guild bank deposit, guild bank withdraw and vendor buy.</td>
+    <td>Run whitelisted inventory actions including bank deposit/withdraw, guild bank deposit/withdraw, vendor buy, bulk sell and residual open-items operations. Each action has endpoint-specific validation; this is not a generic item-command executor.</td>
   </tr>
   <tr>
     <td><code>RUN~OUTFIT</code></td>
@@ -553,9 +589,17 @@ nc ?
 ss ?
 ```
 
-The bridge only replaces the automatic data-refresh paths used by the addon UI.
+The bridge replaces migrated automatic data-refresh paths and selected gameplay write paths with explicit, whitelisted contracts. It is intentionally **not** a generic Playerbots command executor.
 
 Formation selection and inspection are also bridge-first. `RUN~FORMATION` applies a validated formation across the whole current party or raid, while `GET~FORMATIONS` reads the effective value from each controllable bot. Neither path requires PARTY, RAID, whisper or `TellMaster` output. The `GROUP` scope intentionally covers the complete party or raid; individual raid subgroups are not targeted.
+
+## Enchanting Trade Service
+
+The Enchanting Trade Service is intentionally narrower than a generic cast endpoint. `ENCHANT_TRADE_V1` discovers only spells the selected bot actually knows that belong to the Enchanting skill line and contain a valid non-soulbinding `SPELL_EFFECT_ENCHANT_ITEM`. Execution accepts only the numeric spell ID, revalidates the requester/bot Trade relationship and `TRADE_SLOT_NONTRADED`, then uses native `SpellCastTargets::SetTradeItemTarget()` and Core `Spell::prepare()`. The normal Trade accept path performs Core validation again before the enchant is finalized.
+
+Discovery responses are capped at 256 enchantment entries. `ENCHANT_TRADE_END` reports the number of `ENCHANT_TRADE_ITEM` entries actually sent after that cap and per-packet budget checks.
+
+Runtime validation on 2026-08-14 confirmed list retrieval, reagent/tool status, native Trade-window targeting and a real item enchant. No generic Playerbots command/cast executor or automatic chat path is exposed by this capability.
 
 ## Warlock strategy selectors and stone switching
 
@@ -572,6 +616,24 @@ Firestone/Spellstone switching needs one additional bridge-side guard because Pl
 No Firestone/Spellstone enchant ID is hardcoded by this switch path, and `mod-playerbots` does not need to be modified.
 
 For targeted verification, `GET~WEAPON_ENCHANT` / `WEAPON_ENCHANT` exposes an on-demand diagnostic snapshot of the equipped weapon temporary-enchant state. It checks bot visibility/control security and applies a 500 ms per-requester rate limit. It is not used for automatic polling.
+
+The endpoint and switching implementation remain present, while the project's final real Firestone/Spellstone `TEMP_ENCHANTMENT_SLOT` revalidation is intentionally deferred until the end of the normal roadmap.
+
+---
+
+# Current Development Baseline
+
+Documentation synchronized on **2026-08-14** against:
+
+- addon `main`: `106074c3c93f80812f73af27e746860c7c8a4dcf` (PR #61, Group Roll UI);
+- bridge `main`: `210bd1f4f6597fe4f0691ec729ec4904ebe2d463` (PR #26, Group Roll support).
+
+Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service.
+
+The current PR candidate adds `ENCHANT_TRADE_V1` on top of the Group Roll main baseline. Runtime validation on 2026-08-14 confirmed known-enchant listing, native Trade-slot execution and a real item enchant with no generic cast/chat executor.
+
+The next normal roadmap item is **item-specific loot-rule add/remove**. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
+
 
 ---
 

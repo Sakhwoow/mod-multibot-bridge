@@ -77,12 +77,20 @@ std::size_t constexpr kStrategyMutationRateLimit = 24;
 std::chrono::milliseconds constexpr kStrategyMutationRateWindow(2000);
 std::size_t constexpr kItemActionRateLimit = 24;
 std::chrono::milliseconds constexpr kItemActionRateWindow(2000);
+std::size_t constexpr kGroupRollRateLimit = 4;
+std::chrono::milliseconds constexpr kGroupRollRateWindow(2000);
+std::size_t constexpr kEnchantTradeRateLimit = 4;
+std::chrono::milliseconds constexpr kEnchantTradeRateWindow(2000);
+std::size_t constexpr kMaxEnchantTradeEntries = 256;
+std::size_t constexpr kMaxGroupRollItemLinkLength = 160;
 char const* const kStateFramingCapability = "STATE_FRAMING_V1";
 char const* const kStrategyMutationCapability = "STRATEGY_MUTATION_V1";
 char const* const kOutfitCapability = "OUTFIT_V1";
 char const* const kInventoryCapability = "INVENTORY_V1";
 char const* const kInventoryBulkSellCapability = "INVENTORY_BULK_SELL_V1";
 char const* const kInventoryOpenCapability = "INVENTORY_OPEN_V1";
+char const* const kGroupRollCapability = "GROUP_ROLL_V1";
+char const* const kEnchantTradeCapability = "ENCHANT_TRADE_V1";
 uint32 constexpr kMaxItemActionCount = 1000;
 
 enum class BridgePayloadStatus
@@ -108,7 +116,10 @@ void SendTrainerPackets(Player* requester, ChatMsg replyType, std::string const&
 void RunOutfitCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& encodedSuffix, std::string const& persistToken);
 void RunTrainerLearnCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& trainerEntryValue, std::string const& spellIdValue);
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue);
+void SendEnchantTradePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
+void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue);
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue);
+void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink);
 void RunFormationCommand(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken, std::string const& encodedFormation);
 void SendFormationPackets(Player* requester, ChatMsg replyType, std::string const& scopeValue, std::string const& encodedTarget, std::string const& requestToken);
 void SendBotReputationPackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken);
@@ -1742,6 +1753,17 @@ std::string GetSpellCastFailureReason(SpellCastResult result)
             return "NOT_READY";
         case SPELL_FAILED_OUT_OF_RANGE:
             return "OUT_OF_RANGE";
+        case SPELL_FAILED_NOT_TRADING:
+            return "NO_TRADE";
+        case SPELL_FAILED_ITEM_ALREADY_ENCHANTED:
+            return "ALREADY_ENCHANTED";
+        case SPELL_FAILED_NOT_TRADEABLE:
+            return "NOT_TRADEABLE";
+        case SPELL_FAILED_BAD_TARGETS:
+        case SPELL_FAILED_ITEM_ENCHANT_TRADE_WINDOW:
+            return "BAD_TARGET";
+        case SPELL_FAILED_AFFECTING_COMBAT:
+            return "IN_COMBAT";
         case SPELL_FAILED_TRY_AGAIN:
             return "TRY_AGAIN";
         default:
@@ -1923,6 +1945,129 @@ std::vector<ProfessionRecipeEntryData> BuildProfessionRecipeEntries(Player* bot,
             return left.spellName < right.spellName;
         return left.spellId < right.spellId;
     });
+
+    return entries;
+}
+
+struct EnchantTradeMaterialData
+{
+    uint32 itemId = 0;
+    uint32 required = 0;
+    uint32 available = 0;
+};
+
+struct EnchantTradeEntryData
+{
+    uint32 spellId = 0;
+    std::string spellName;
+    std::string difficulty;
+    uint32 available = 0;
+    uint32 hasTools = 0;
+    std::vector<EnchantTradeMaterialData> materials;
+};
+
+bool IsEnchantTradeSpell(SpellInfo const* spellInfo)
+{
+    if (!spellInfo || spellInfo->IsPassive())
+        return false;
+
+    for (uint32 effectIndex = 0; effectIndex < MAX_SPELL_EFFECTS; ++effectIndex)
+    {
+        if (spellInfo->Effects[effectIndex].Effect != SPELL_EFFECT_ENCHANT_ITEM)
+            continue;
+
+        SpellItemEnchantmentEntry const* const enchantEntry =
+            sSpellItemEnchantmentStore.LookupEntry(spellInfo->Effects[effectIndex].MiscValue);
+        if (enchantEntry && !(enchantEntry->slot & ENCHANTMENT_CAN_SOULBOUND))
+            return true;
+    }
+
+    return false;
+}
+
+void BuildEnchantTradeMaterials(SpellInfo const* spellInfo, std::map<uint32, uint32> const& itemCounts,
+    std::vector<EnchantTradeMaterialData>& materials, uint32& available)
+{
+    materials.clear();
+    available = spellInfo ? 1 : 0;
+    if (!spellInfo)
+        return;
+
+    for (uint32 index = 0; index < MAX_SPELL_REAGENTS; ++index)
+    {
+        if (spellInfo->Reagent[index] <= 0 || spellInfo->ReagentCount[index] <= 0)
+            continue;
+
+        EnchantTradeMaterialData material;
+        material.itemId = static_cast<uint32>(spellInfo->Reagent[index]);
+        material.required = spellInfo->ReagentCount[index];
+        material.available = itemCounts.count(material.itemId) ? itemCounts.at(material.itemId) : 0;
+        if (material.available < material.required)
+            available = 0;
+        materials.push_back(material);
+    }
+}
+
+std::string ValidateEnchantTradeSpellIdentity(Player* bot, uint32 spellId, SpellInfo const*& spellInfo)
+{
+    spellInfo = nullptr;
+    if (!bot || !spellId)
+        return "BAD_REQUEST";
+
+    if (!bot->HasSkill(SKILL_ENCHANTING))
+        return "NOT_ENCHANTER";
+
+    if (!IsKnownActiveBotSpell(bot, spellId))
+        return "UNKNOWN_ENCHANT";
+
+    SkillLineAbilityEntry const* const skillLine = GetSkillLineAbilityForSpell(spellId);
+    if (!skillLine || skillLine->SkillLine != SKILL_ENCHANTING)
+        return "BAD_ENCHANT";
+
+    spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!IsEnchantTradeSpell(spellInfo))
+        return "BAD_ENCHANT";
+
+    return "OK";
+}
+
+std::vector<EnchantTradeEntryData> BuildEnchantTradeEntries(Player* bot)
+{
+    std::vector<EnchantTradeEntryData> entries;
+    if (!bot || !bot->HasSkill(SKILL_ENCHANTING))
+        return entries;
+
+    std::map<uint32, uint32> const itemCounts = BuildBotInventoryItemCounts(bot);
+    for (PlayerSpellMap::const_iterator it = bot->GetSpellMap().begin(); it != bot->GetSpellMap().end(); ++it)
+    {
+        SpellInfo const* spellInfo = nullptr;
+        if (ValidateEnchantTradeSpellIdentity(bot, it->first, spellInfo) != "OK" || !spellInfo || !spellInfo->SpellName[0])
+            continue;
+
+        SkillLineAbilityEntry const* const skillLine = GetSkillLineAbilityForSpell(it->first);
+        if (!skillLine)
+            continue;
+
+        EnchantTradeEntryData entry;
+        entry.spellId = it->first;
+        entry.spellName = spellInfo->SpellName[0];
+        entry.difficulty = GetRecipeDifficulty(bot, skillLine);
+        BuildEnchantTradeMaterials(spellInfo, itemCounts, entry.materials, entry.available);
+        entry.hasTools = BotHasRecipeRequiredTools(bot, spellInfo) ? 1 : 0;
+        if (!entry.hasTools)
+            entry.available = 0;
+        entries.push_back(entry);
+    }
+
+    std::sort(entries.begin(), entries.end(), [](EnchantTradeEntryData const& left, EnchantTradeEntryData const& right)
+    {
+        if (left.spellName != right.spellName)
+            return left.spellName < right.spellName;
+        return left.spellId < right.spellId;
+    });
+
+    if (entries.size() > kMaxEnchantTradeEntries)
+        entries.resize(kMaxEnchantTradeEntries);
 
     return entries;
 }
@@ -4318,6 +4463,163 @@ bool ConsumeItemActionRateLimit(Player* requester)
     return true;
 }
 
+struct GroupRollRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+};
+
+std::map<std::string, GroupRollRateState> sGroupRollRateStates;
+
+bool ConsumeGroupRollRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    GroupRollRateState& state = sGroupRollRateStates[key];
+
+    while (!state.requests.empty() && now - state.requests.front() >= kGroupRollRateWindow)
+        state.requests.pop_front();
+
+    if (state.requests.size() >= kGroupRollRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sGroupRollRateStates.size() > 512)
+    {
+        for (auto it = sGroupRollRateStates.begin(); it != sGroupRollRateStates.end();)
+        {
+            while (!it->second.requests.empty() && now - it->second.requests.front() >= kGroupRollRateWindow)
+                it->second.requests.pop_front();
+
+            if (it->second.requests.empty() && it->first != key)
+                it = sGroupRollRateStates.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+struct EnchantTradeRateState
+{
+    std::deque<std::chrono::steady_clock::time_point> requests;
+};
+
+std::map<std::string, EnchantTradeRateState> sEnchantTradeRateStates;
+
+bool ConsumeEnchantTradeRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+    EnchantTradeRateState& state = sEnchantTradeRateStates[key];
+
+    while (!state.requests.empty() && now - state.requests.front() >= kEnchantTradeRateWindow)
+        state.requests.pop_front();
+
+    if (state.requests.size() >= kEnchantTradeRateLimit)
+        return false;
+
+    state.requests.push_back(now);
+
+    if (sEnchantTradeRateStates.size() > 512)
+    {
+        for (auto it = sEnchantTradeRateStates.begin(); it != sEnchantTradeRateStates.end();)
+        {
+            while (!it->second.requests.empty() && now - it->second.requests.front() >= kEnchantTradeRateWindow)
+                it->second.requests.pop_front();
+
+            if (it->second.requests.empty() && it->first != key)
+                it = sEnchantTradeRateStates.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
+void RunGroupRollCommand(Player* requester, ChatMsg replyType, std::string const& requestToken, std::string const& modeValue, std::string const& encodedItemLink)
+{
+    std::string const token = Trim(requestToken);
+    std::string const mode = ToUpper(Trim(modeValue));
+    std::string itemLink;
+    std::string scope = "NONE";
+    std::string reason = "OK";
+    uint32 matched = 0;
+    uint32 invoked = 0;
+
+    if (!requester || !IsValidRequestToken(token) || (mode != "NORMAL" && mode != "ITEM"))
+    {
+        reason = "BAD_REQUEST";
+    }
+    else if (mode == "ITEM" &&
+             (!TryUrlDecodeField(encodedItemLink, itemLink, kMaxGroupRollItemLinkLength, false) ||
+              itemLink.find("|Hitem:") == std::string::npos))
+    {
+        reason = "BAD_ITEM";
+    }
+    else if (mode == "NORMAL" && !encodedItemLink.empty())
+    {
+        reason = "BAD_REQUEST";
+    }
+    else if (!ConsumeGroupRollRateLimit(requester))
+    {
+        reason = "RATE_LIMIT";
+    }
+    else
+    {
+        Group* const group = requester->GetGroup();
+        if (!group)
+        {
+            reason = "NO_GROUP";
+        }
+        else
+        {
+            scope = group->isRaidGroup() ? "RAID" : "PARTY";
+            for (Player* const bot : GetBridgeVisibleBots(requester))
+            {
+                if (!bot || bot->GetGroup() != group)
+                    continue;
+
+                ++matched;
+                PlayerbotAI* const botAI = GetBotAI(bot);
+                if (!botAI || !botAI->GetSecurity() ||
+                    !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+                {
+                    continue;
+                }
+
+                botAI->DoSpecificAction("roll", Event("roll", itemLink, requester), true);
+                ++invoked;
+            }
+
+            if (!matched)
+                reason = "NO_BOTS";
+            else if (!invoked)
+                reason = "FORBIDDEN";
+        }
+    }
+
+    std::string const status = reason == "OK" ? "OK" : "ERR";
+    std::ostringstream payload;
+    payload << token
+        << kFieldSeparator << status
+        << kFieldSeparator << mode
+        << kFieldSeparator << scope
+        << kFieldSeparator << matched
+        << kFieldSeparator << invoked
+        << kFieldSeparator << UrlEncodeField(reason);
+
+    SendAddonPacket(requester, replyType, "GROUP_ROLL_ACK", payload.str());
+}
+
 void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& actionValue, std::string const& itemIdValue, std::string const& countValue)
 {
     std::string const trimmedBotName = Trim(botName);
@@ -4510,6 +4812,207 @@ void RunInventoryItemActionCommand(Player* requester, ChatMsg replyType, std::st
         << kFieldSeparator << moved;
 
     SendAddonPacket(requester, replyType, "INVENTORY_ITEM_ACTION", payload.str());
+}
+
+void SendEnchantTradePackets(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+    std::string reason = "OK";
+
+    if (!ConsumeEnchantTradeRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!bot)
+        reason = "NO_BOT";
+    else
+    {
+        PlayerbotAI* const botAI = GetBotAI(bot);
+        if (!botAI || !botAI->GetSecurity() ||
+            !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+        {
+            reason = "FORBIDDEN";
+        }
+        else if (!bot->HasSkill(SKILL_ENCHANTING))
+            reason = "NOT_ENCHANTER";
+    }
+
+    uint32 const skillValue = bot && bot->HasSkill(SKILL_ENCHANTING) ? bot->GetSkillValue(SKILL_ENCHANTING) : 0;
+    uint32 const maxSkill = bot && bot->HasSkill(SKILL_ENCHANTING) ? bot->GetMaxSkillValue(SKILL_ENCHANTING) : 0;
+    bool const ok = reason == "OK";
+
+    std::ostringstream beginPayload;
+    beginPayload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << skillValue
+        << kFieldSeparator << maxSkill;
+    SendAddonPacket(requester, replyType, "ENCHANT_TRADE_BEGIN", beginPayload.str());
+
+    uint32 count = 0;
+    if (ok)
+    {
+        for (EnchantTradeEntryData const& entry : BuildEnchantTradeEntries(bot))
+        {
+            std::ostringstream payload;
+            payload << UrlEncodeField(effectiveBotName)
+                << kFieldSeparator << token
+                << kFieldSeparator << entry.spellId
+                << kFieldSeparator << UrlEncodeField(entry.difficulty)
+                << kFieldSeparator << entry.available
+                << kFieldSeparator << entry.hasTools
+                << kFieldSeparator << entry.materials.size();
+            if (!IsAddonPacketWithinBudget("ENCHANT_TRADE_ITEM", payload.str()))
+                continue;
+
+            SendAddonPacket(requester, replyType, "ENCHANT_TRADE_ITEM", payload.str());
+            uint32 materialIndex = 0;
+            for (EnchantTradeMaterialData const& material : entry.materials)
+            {
+                ++materialIndex;
+                std::ostringstream materialPayload;
+                materialPayload << UrlEncodeField(effectiveBotName)
+                    << kFieldSeparator << token
+                    << kFieldSeparator << entry.spellId
+                    << kFieldSeparator << materialIndex
+                    << kFieldSeparator << material.itemId
+                    << kFieldSeparator << material.required
+                    << kFieldSeparator << material.available;
+                if (IsAddonPacketWithinBudget("ENCHANT_TRADE_MATERIAL", materialPayload.str()))
+                    SendAddonPacket(requester, replyType, "ENCHANT_TRADE_MATERIAL", materialPayload.str());
+            }
+            ++count;
+        }
+    }
+
+    std::ostringstream endPayload;
+    endPayload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << (ok ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << count;
+    SendAddonPacket(requester, replyType, "ENCHANT_TRADE_END", endPayload.str());
+}
+
+std::string ValidateEnchantTradeContext(Player* requester, Player* bot, uint32 spellId, SpellInfo const*& spellInfo)
+{
+    if (!requester || !bot)
+        return "BAD_REQUEST";
+
+    PlayerbotAI* const botAI = GetBotAI(bot);
+    if (!botAI || !botAI->GetSecurity() ||
+        !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, true, requester))
+    {
+        return "FORBIDDEN";
+    }
+
+    if (!bot->GetSession())
+        return "NO_SESSION";
+
+    std::string const identityReason = ValidateEnchantTradeSpellIdentity(bot, spellId, spellInfo);
+    if (identityReason != "OK")
+        return identityReason;
+
+    if (!BotHasRecipeRequiredTools(bot, spellInfo))
+        return "MISSING_TOOLS";
+
+    uint32 materialsAvailable = 0;
+    std::vector<EnchantTradeMaterialData> materials;
+    BuildEnchantTradeMaterials(spellInfo, BuildBotInventoryItemCounts(bot), materials, materialsAvailable);
+    if (!materialsAvailable)
+        return "NO_MATERIALS";
+
+    if (bot->IsInCombat())
+        return "IN_COMBAT";
+    if (bot->HasUnitState(UNIT_STATE_LOST_CONTROL))
+        return "LOST_CONTROL";
+    if (bot->IsFlying() || bot->HasUnitState(UNIT_STATE_IN_FLIGHT))
+        return "IN_FLIGHT";
+    if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr)
+        return "CHANNELING";
+    if (bot->HasSpellCooldown(spellId))
+        return "NOT_READY";
+    if (!bot->IsStandState())
+    {
+        bot->SetStandState(UNIT_STAND_STATE_STAND);
+        return "NOT_STANDING";
+    }
+
+    uint32 const castTime = !spellInfo->IsChanneled() ? spellInfo->CalcCastTime(bot) : spellInfo->GetDuration();
+    if ((castTime || spellInfo->IsAutoRepeatRangedSpell()) && bot->isMoving())
+        return "MOVING";
+
+    TradeData* const botTrade = bot->GetTradeData();
+    TradeData* const requesterTrade = requester ? requester->GetTradeData() : nullptr;
+    if (!botTrade || !requesterTrade)
+        return "NO_TRADE";
+    if (botTrade->GetTrader() != requester || requesterTrade->GetTrader() != bot)
+        return "WRONG_TRADER";
+    if (!requesterTrade->GetItem(TRADE_SLOT_NONTRADED))
+        return "NO_TRADE_ITEM";
+    if (botTrade->GetSpell())
+        return "ALREADY_ENCHANTED";
+
+    return "OK";
+}
+
+void RunEnchantTradeCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& spellIdValue)
+{
+    std::string const trimmedBotName = Trim(botName);
+    std::string const token = Trim(requestToken);
+    uint32 spellId = 0;
+    TryParseUint32Field(Trim(spellIdValue), 1, std::numeric_limits<uint32>::max(), spellId);
+
+    Player* const bot = FindBotByName(requester, trimmedBotName);
+    std::string const effectiveBotName = bot ? bot->GetName() : trimmedBotName;
+    std::string reason = "OK";
+    bool accepted = false;
+
+    if (!ConsumeEnchantTradeRateLimit(requester))
+        reason = "RATE_LIMIT";
+    else if (!bot)
+        reason = "NO_BOT";
+    else
+    {
+        SpellInfo const* spellInfo = nullptr;
+        reason = ValidateEnchantTradeContext(requester, bot, spellId, spellInfo);
+        if (reason == "OK")
+        {
+            SpellCastTargets targets;
+            targets.SetTradeItemTarget(bot);
+
+            // Mirror the native TradeHandler validation path without preparing a
+            // heap-allocated Spell here. The Core owns final spell preparation
+            // when the normal trade is accepted.
+            Spell spell(bot, spellInfo, TRIGGERED_FULL_MASK);
+            spell.m_targets = targets;
+            SpellCastResult const result = spell.CheckCast(true);
+            reason = GetSpellCastFailureReason(result);
+
+            if (result == SPELL_CAST_OK)
+            {
+                TradeData* const botTrade = bot->GetTradeData();
+                if (!botTrade)
+                    reason = "NO_TRADE";
+                else
+                {
+                    botTrade->SetSpell(spellId);
+                    accepted = true;
+                }
+            }
+        }
+    }
+
+    std::ostringstream payload;
+    payload << UrlEncodeField(effectiveBotName)
+        << kFieldSeparator << token
+        << kFieldSeparator << spellId
+        << kFieldSeparator << (accepted ? "OK" : "ERR")
+        << kFieldSeparator << UrlEncodeField(reason)
+        << kFieldSeparator << (accepted ? 1 : 0);
+    SendAddonPacket(requester, replyType, "ENCHANT_TRADE_RESULT", payload.str());
 }
 
 void RunProfessionRecipeCraftCommand(Player* requester, ChatMsg replyType, std::string const& botName, std::string const& requestToken, std::string const& skillIdValue, std::string const& spellIdValue, std::string const& itemIdValue)
@@ -6341,7 +6844,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             player,
             replyType,
             "CAPS",
-            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability);
+            std::string(kStateFramingCapability) + "," + kStrategyMutationCapability + "," + kOutfitCapability + "," + kInventoryCapability + "," + kInventoryBulkSellCapability + "," + kInventoryOpenCapability + "," + kGroupRollCapability + "," + kEnchantTradeCapability);
         return true;
     }
 
@@ -6647,6 +7150,22 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             return true;
         }
 
+        if (requestType == "ENCHANT_TRADE")
+        {
+            std::string const token = GetSafeErrorToken(fields, 2);
+            if (fields.size() != 3)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+            if (!IsValidRequestToken(fields[2]))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            SendEnchantTradePackets(player, replyType, fields[1], fields[2]);
+            return true;
+        }
+
         if (requestType == "PROFESSION_RECIPES")
         {
             std::string const token = GetSafeErrorToken(fields, 3);
@@ -6719,6 +7238,26 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         return true;
     }
 
+    if (requestType == "ENCHANT_TRADE")
+    {
+        std::string const token = GetSafeErrorToken(fields, 2);
+        if (fields.size() != 4)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_BOT_NAME");
+
+        if (!IsValidRequestToken(fields[2]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        uint32 spellId = 0;
+        if (!TryParseUint32Field(fields[3], 1, std::numeric_limits<uint32>::max(), spellId))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_NUMBER");
+
+        RunEnchantTradeCommand(player, replyType, fields[1], fields[2], fields[3]);
+        return true;
+    }
+
     if (requestType == "CRAFT_RECIPE")
     {
         std::string const token = GetSafeErrorToken(fields, 2);
@@ -6742,6 +7281,45 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         }
 
         RunProfessionRecipeCraftCommand(player, replyType, fields[1], fields[2], fields[3], fields[4], fields[5]);
+        return true;
+    }
+
+    if (requestType == "GROUP_ROLL")
+    {
+        std::string const token = GetSafeErrorToken(fields, 1);
+        if (fields.size() < 3 || fields.size() > 4)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidRequestToken(fields[1]))
+            return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+        std::string const mode = ToUpper(Trim(fields[2]));
+        if (fields[2] != mode || (mode != "NORMAL" && mode != "ITEM"))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_MODE");
+
+        if (mode == "NORMAL")
+        {
+            if (fields.size() != 3)
+                return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+            RunGroupRollCommand(player, replyType, fields[1], fields[2], "");
+            return true;
+        }
+
+        if (fields.size() != 4)
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
+
+        if (!IsValidEncodedField(fields[3], kMaxGroupRollItemLinkLength, false))
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_ENCODING");
+
+        std::string itemLink;
+        if (!TryUrlDecodeField(fields[3], itemLink, kMaxGroupRollItemLinkLength, false) ||
+            itemLink.find("|Hitem:") == std::string::npos)
+        {
+            return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_ITEM");
+        }
+
+        RunGroupRollCommand(player, replyType, fields[1], fields[2], fields[3]);
         return true;
     }
 
