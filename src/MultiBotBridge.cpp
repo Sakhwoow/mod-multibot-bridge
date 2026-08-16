@@ -33,6 +33,7 @@
 #include "SpellMgr.h"
 #include "Trainer.h"
 #include "Unit.h"
+#include "Timer.h"
 #include "World.h"
 #include "WorldPacket.h"
 
@@ -1011,12 +1012,16 @@ PvpStatsData BuildPvpStatsData(Player* bot)
     data.arenaPoints = bot->GetArenaPoints();
     data.honorPoints = bot->GetHonorPoints();
 
+    uint32 const _t0_pvp = getMSTime();
     QueryResult result = CharacterDatabase.Query(
         "SELECT at.type, at.name, at.rating "
         "FROM arena_team_member atm "
         "INNER JOIN arena_team at ON at.arenaTeamId = atm.arenaTeamId "
         "WHERE atm.guid = {}",
         bot->GetGUID().GetCounter());
+    uint32 const _dt_pvp = GetMSTimeDiffToNow(_t0_pvp);
+    if (_dt_pvp > 200)
+        LOG_WARN("playerbots", "Bridge: PVP_STATS arena_team query for {} took {}ms", bot->GetName(), _dt_pvp);
 
     if (!result)
         return data;
@@ -1214,9 +1219,13 @@ uint32 FindGlyphItemId(uint32 glyphId, uint32 spellId)
 
     if (!itemId && glyphId)
     {
+        uint32 const _t0_glyph = getMSTime();
         QueryResult result = WorldDatabase.Query(
             "SELECT entry, spellid_1, spellid_2, spellid_3, spellid_4, spellid_5 "
             "FROM item_template WHERE class = 16");
+        uint32 const _dt_glyph = GetMSTimeDiffToNow(_t0_glyph);
+        if (_dt_glyph > 200)
+            LOG_WARN("playerbots", "Bridge: GLYPHS item_template full scan took {}ms", _dt_glyph);
 
         if (result)
         {
@@ -1366,9 +1375,13 @@ std::vector<QuestEntryData> BuildQuestEntries(Player* bot, std::string const& mo
     // Certains forks stockent les quêtes actives avec un statut DB brut 0/1/3,
     // qui ne correspond pas toujours directement à l'enum runtime QuestStatus.
 
+    uint32 const _t0_quest = getMSTime();
     QueryResult result = CharacterDatabase.Query(
         "SELECT quest, status FROM character_queststatus WHERE guid = {}",
         bot->GetGUID().GetCounter());
+    uint32 const _dt_quest = GetMSTimeDiffToNow(_t0_quest);
+    if (_dt_quest > 200)
+        LOG_WARN("playerbots", "Bridge: QUESTS character_queststatus query for {} took {}ms", bot->GetName(), _dt_quest);
 
     if (!result)
         return entries;
@@ -2279,10 +2292,14 @@ int32 GetGuildBankTabWithdrawRemaining(Guild* guild, Player* player, uint8 tabId
     if (member->IsRank(GR_GUILDMASTER) || guild->GetLeaderGUID() == player->GetGUID())
         return std::numeric_limits<int32>::max();
 
+    uint32 const _t0_gbr = getMSTime();
     QueryResult result = CharacterDatabase.Query(
         "SELECT gbright, SlotPerDay FROM guild_bank_right "
         "WHERE guildid = {} AND TabId = {} AND rid = {}",
         guild->GetId(), uint32(tabId), uint32(member->GetRankId()));
+    uint32 const _dt_gbr = GetMSTimeDiffToNow(_t0_gbr);
+    if (_dt_gbr > 200)
+        LOG_WARN("playerbots", "Bridge: GBANK guild_bank_right query took {}ms", _dt_gbr);
 
     if (!result)
         return 0;
@@ -2477,6 +2494,7 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
             || !guild->MemberHasTabRights(bot->GetGUID(), tabId, GUILD_BANK_RIGHT_VIEW_TAB))
             continue;
 
+        uint32 const _t0_gbi = getMSTime();
         QueryResult result = CharacterDatabase.Query(
             "SELECT ii.itemEntry, ii.count "
             "FROM guild_bank_item gbi "
@@ -2484,6 +2502,9 @@ void SendGuildBankPackets(Player* requester, ChatMsg replyType, std::string cons
             "WHERE gbi.guildid = {} AND gbi.TabId = {} "
             "ORDER BY gbi.SlotId",
             guild->GetId(), uint32(tabId));
+        uint32 const _dt_gbi = GetMSTimeDiffToNow(_t0_gbi);
+        if (_dt_gbi > 200)
+            LOG_WARN("playerbots", "Bridge: GBANK guild_bank_item tab {} query took {}ms", tabId, _dt_gbi);
 
         if (!result)
             continue;
@@ -3857,8 +3878,12 @@ BridgeReferenceLootRows BuildBridgeReferenceLootRows()
 {
     BridgeReferenceLootRows rows;
 
+    uint32 const _t0_loot = getMSTime();
     QueryResult result = WorldDatabase.Query(
         "SELECT Entry, Item, Reference FROM reference_loot_template");
+    uint32 const _dt_loot = GetMSTimeDiffToNow(_t0_loot);
+    if (_dt_loot > 500)
+        LOG_WARN("playerbots", "Bridge: PROFESSION_RECIPES reference_loot_template query took {}ms", _dt_loot);
     if (!result)
         return rows;
 
