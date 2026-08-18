@@ -6364,6 +6364,38 @@ Player* FindBotByName(Player* player, std::string const& botName)
     return nullptr;
 }
 
+// Shared 3-second budget for ALL bulk GET operations (any handler that iterates all visible bots).
+// Prevents simultaneous QUESTS+GLYPHS+STATS+STATES spam from different handlers.
+// Individual heavy handlers add a second ConsumeHeavyGetRateLimit on top.
+bool ConsumeBulkReadRateLimit(Player* requester)
+{
+    if (!requester)
+        return false;
+
+    static std::map<std::string, std::chrono::steady_clock::time_point> lastRequests;
+    std::chrono::steady_clock::time_point const now = std::chrono::steady_clock::now();
+    std::string const key = requester->GetName();
+
+    auto const existing = lastRequests.find(key);
+    if (existing != lastRequests.end() && now - existing->second < std::chrono::seconds(3))
+        return false;
+
+    lastRequests[key] = now;
+
+    if (lastRequests.size() > 512)
+    {
+        for (auto it = lastRequests.begin(); it != lastRequests.end();)
+        {
+            if (it->first != key && now - it->second >= std::chrono::seconds(60))
+                it = lastRequests.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    return true;
+}
+
 bool ConsumeHeavyGetRateLimit(Player* requester, std::string const& handlerKey)
 {
     if (!requester)
@@ -6392,6 +6424,7 @@ bool ConsumeHeavyGetRateLimit(Player* requester, std::string const& handlerKey)
 
     return true;
 }
+
 
 bool ConsumeWeaponEnchantDebugRateLimit(Player* requester)
 {
@@ -6778,10 +6811,55 @@ void SendFramedStatePackets(Player* player, ChatMsg replyType, std::string const
         SendStateAbort(player, replyType, token, "", "SEND_FAILED");
 }
 
+static std::string TruncateToWireLimit(std::string const& name, std::string const& combat, std::string const& nonCombat)
+{
+    // Build payload truncating nonCombat then combat until it fits 255 wire bytes
+    auto fits = [&](std::string const& c, std::string const& nc) -> bool {
+        std::ostringstream t;
+        t << name << kFieldSeparator << c << kFieldSeparator << nc;
+        return GetAddonWireLength("STATE", t.str()) <= kMaxBridgeWireLength;
+    };
+
+    if (fits(combat, nonCombat))
+    {
+        std::ostringstream out;
+        out << name << kFieldSeparator << combat << kFieldSeparator << nonCombat;
+        return out.str();
+    }
+
+    // Try dropping nonCombat entirely
+    if (fits(combat, ""))
+    {
+        std::ostringstream out;
+        out << name << kFieldSeparator << combat << kFieldSeparator;
+        return out.str();
+    }
+
+    // Truncate combat to last comma that still fits
+    std::string c = combat;
+    while (!c.empty())
+    {
+        std::size_t pos = c.rfind(',');
+        if (pos == std::string::npos)
+            c.clear();
+        else
+            c = c.substr(0, pos);
+        if (fits(c, ""))
+        {
+            std::ostringstream out;
+            out << name << kFieldSeparator << c << kFieldSeparator;
+            return out.str();
+        }
+    }
+
+    std::ostringstream out;
+    out << name << kFieldSeparator << kFieldSeparator;
+    return out.str();
+}
+
 void SendStatePackets(Player* player, ChatMsg replyType)
 {
     bool sent = false;
-    bool stateTooLong = false;
     for (Player* const bot : GetBridgeVisibleBots(player))
     {
         PlayerbotAI* const botAI = sPlayerbotsMgr.GetPlayerbotAI(bot);
@@ -6794,17 +6872,13 @@ void SendStatePackets(Player* player, ChatMsg replyType)
             nonCombatStrategies = JoinStrategies(botAI->GetStrategies(BOT_STATE_NON_COMBAT));
         }
 
-        std::ostringstream out;
-        out << bot->GetName() << kFieldSeparator << combatStrategies << kFieldSeparator << nonCombatStrategies;
-        if (!SendStateAddonPacket(player, replyType, "STATE", out.str()))
-            stateTooLong = true;
+        std::string const payload = TruncateToWireLimit(bot->GetName(), combatStrategies, nonCombatStrategies);
+        SendAddonPacket(player, replyType, "STATE", payload);
         sent = true;
     }
 
     if (!sent)
         SendAddonPacket(player, replyType, "STATES", "");
-    else if (stateTooLong)
-        SendProtocolError(player, replyType, "GET", "STATES", "", "STATE_TOO_LONG");
 }
 
 std::string BuildStatsPayload(Player* player, std::string const& botName)
@@ -6958,6 +7032,8 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
         {
             if (fields.size() == 1)
             {
+                if (!ConsumeBulkReadRateLimit(player))
+                    return true;
                 SendStatePackets(player, replyType);
                 return true;
             }
@@ -6967,6 +7043,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 return SendProtocolError(player, replyType, normalized, requestType, token, "BAD_FIELD_COUNT");
             if (!IsValidRequestToken(fields[1]))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            if (!ConsumeBulkReadRateLimit(player))
+                return true;
 
             SendFramedStatePackets(player, replyType, fields[1]);
             return true;
@@ -7021,6 +7100,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             if (!IsValidRequestToken(fields[3]))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
+            if (!ConsumeBulkReadRateLimit(player))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
+
             if (!ConsumeHeavyGetRateLimit(player, "QUESTS"))
                 return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
 
@@ -7040,6 +7122,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             if (!IsValidRequestToken(fields[2]))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
+            if (!ConsumeBulkReadRateLimit(player))
+                return SendProtocolError(player, replyType, normalized, requestType, fields[2], "TOO_MANY_REQUESTS");
+
             SendGameObjectPackets(player, replyType, fields[1], fields[2]);
             return true;
         }
@@ -7056,6 +7141,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
             if (!IsValidRequestToken(fields[2]))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
+            if (!ConsumeBulkReadRateLimit(player))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
+
             if (!ConsumeHeavyGetRateLimit(player, "GLYPHS"))
                 return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
 
@@ -7070,6 +7158,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
             if (fields.size() == 2 && !IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_BOT_NAME");
+
+            if (!ConsumeBulkReadRateLimit(player))
+                return SendProtocolError(player, replyType, normalized, requestType, "", "TOO_MANY_REQUESTS");
 
             if (!ConsumeHeavyGetRateLimit(player, requestType))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "TOO_MANY_REQUESTS");
@@ -7130,6 +7221,8 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 SendBankPackets(player, replyType, fields[1], fields[2]);
             else if (requestType == "GBANK")
             {
+                if (!ConsumeBulkReadRateLimit(player))
+                    return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
                 if (!ConsumeHeavyGetRateLimit(player, "GBANK"))
                     return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
                 SendGuildBankPackets(player, replyType, fields[1], fields[2]);
@@ -7181,6 +7274,9 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
 
             if (!IsValidRequestToken(fields[3]))
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
+
+            if (!ConsumeBulkReadRateLimit(player))
+                return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
 
             if (!ConsumeHeavyGetRateLimit(player, "PROFESSION_RECIPES"))
                 return SendProtocolError(player, replyType, normalized, requestType, token, "TOO_MANY_REQUESTS");
