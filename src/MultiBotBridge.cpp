@@ -7008,9 +7008,20 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 if (!IsValidCanonicalRawField(fields[1], kMaxBotNameLength, false))
                     return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_BOT_NAME");
 
-                std::string const legacyPayload = BuildStatePayload(player, fields[1]);
-                if (!SendStateAddonPacket(player, replyType, "STATE", legacyPayload))
-                    return SendProtocolError(player, replyType, normalized, requestType, "", "STATE_TOO_LONG");
+                Player* const legacyBot = FindBotByName(player, fields[1]);
+                std::string legacyPayload;
+                if (legacyBot)
+                {
+                    PlayerbotAI* const legacyAI = sPlayerbotsMgr.GetPlayerbotAI(legacyBot);
+                    std::string const lc = legacyAI ? JoinStrategies(legacyAI->GetStrategies(BOT_STATE_COMBAT)) : "";
+                    std::string const lnc = legacyAI ? JoinStrategies(legacyAI->GetStrategies(BOT_STATE_NON_COMBAT)) : "";
+                    legacyPayload = TruncateToWireLimit(legacyBot->GetName(), lc, lnc);
+                }
+                else
+                {
+                    legacyPayload = BuildStatePayload(player, fields[1]);
+                }
+                SendAddonPacket(player, replyType, "STATE", legacyPayload);
                 return true;
             }
 
