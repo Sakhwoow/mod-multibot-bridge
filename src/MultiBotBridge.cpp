@@ -7045,7 +7045,7 @@ bool HandleBridgeOpcode(Player* player, ChatMsg replyType, std::string const& op
                 return SendProtocolError(player, replyType, normalized, requestType, "", "BAD_TOKEN");
 
             if (!ConsumeBulkReadRateLimit(player))
-                return true;
+                return SendProtocolError(player, replyType, normalized, requestType, fields[1], "TOO_MANY_REQUESTS");
 
             SendFramedStatePackets(player, replyType, fields[1]);
             return true;
