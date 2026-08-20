@@ -336,6 +336,22 @@ Addon  -> Server: MBOT RUN~GROUP_ROLL~<token>~NORMAL
 Addon  -> Server: MBOT RUN~GROUP_ROLL~<token>~ITEM~<encodedItemLink>
 Server -> Addon:  MBOT GROUP_ROLL_ACK~<token>~<status>~<mode>~<scope>~<matched>~<invoked>~<reason>
 
+Addon  -> Server: MBOT GET~INVENTORY_EXACT~<botName>~<token>
+Server -> Addon:  MBOT INV_EXACT_BEGIN~<botName>~<token>
+Server -> Addon:  MBOT INV_BAG~<botName>~<token>~<kind>~<bag>~<slotStart>~<slotCount>~<bagItemId>
+Server -> Addon:  MBOT INV_ITEM_LOC~<botName>~<token>~<bag>~<slot>~<itemId>~<count>~<soulbound>
+Server -> Addon:  MBOT INV_EXACT_ERROR~<botName>~<token>~<reason>  (failure only)
+Server -> Addon:  MBOT INV_EXACT_END~<botName>~<token>
+
+Addon  -> Server: MBOT RUN~ITEM_MOVE~<botName>~<token>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>~<dstBag>~<dstSlot>~<dstItemId>~<dstCount>
+Server -> Addon:  MBOT INVENTORY_ITEM_MOVE~<botName>~<token>~<status>~<reason>~<srcBag>~<srcSlot>~<dstBag>~<dstSlot>
+
+Addon  -> Server: MBOT RUN~ITEM_EQUIP~<botName>~<token>~<srcBag>~<srcSlot>~<srcItemId>~<srcCount>
+Server -> Addon:  MBOT INVENTORY_ITEM_EQUIP~<botName>~<token>~<status>~<reason>~<srcBag>~<srcSlot>~<dstSlot>
+
+Addon  -> Server: MBOT RUN~ITEM_UNEQUIP~<botName>~<token>~<srcSlot>~<srcItemId>
+Server -> Addon:  MBOT INVENTORY_ITEM_UNEQUIP~<botName>~<token>~<status>~<reason>~<srcSlot>~<srcItemId>
+
 Addon  -> Server: MBOT GET~ENCHANT_TRADE~<botName>~<token>
 Server -> Addon:  MBOT ENCHANT_TRADE_BEGIN~<botName>~<token>~<status>~<reason>~<skill>~<maxSkill>
 Server -> Addon:  MBOT ENCHANT_TRADE_ITEM~<botName>~<token>~<spellId>~<difficulty>~<available>~<hasTools>~<materialCount>
@@ -346,7 +362,7 @@ Addon  -> Server: MBOT RUN~ENCHANT_TRADE~<botName>~<token>~<spellId>
 Server -> Addon:  MBOT ENCHANT_TRADE_RESULT~<botName>~<token>~<spellId>~<status>~<reason>~<accepted>
 ```
 
-Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
+Current capability negotiation includes `STATE_FRAMING_V1`, `STRATEGY_MUTATION_V1`, `OUTFIT_V1`, `INVENTORY_V1`, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_DESTROY_V1`, `ITEM_USE_V1`, `ITEM_SELL_SINGLE_V1`, `VENDOR_BUYBACK_V1`, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and `ENCHANT_TRADE_V1`.
 
 The exact payloads are consumed internally by the MultiBot addon.
 
@@ -369,6 +385,14 @@ The bridge enforces the following input rules before any endpoint is called:
 - rejection of control characters;
 - a maximum `ITEM_ACTION` count of 1000, while `0` keeps its existing
   endpoint-specific meaning;
+- `ITEM_MOVE_V1` accepts only exact source/destination coordinates and expected item/count state, with item counts bounded to 1000;
+- `ITEM_MOVE_V1` is rate-limited to 8 requests per requester per 2-second window, rejects replayed request tokens for 10 seconds, keeps at most 32 recent tokens per requester and bounds requester move state to 512 entries;
+- `ITEM_MOVE_V1` revalidates the requester, controllable bot, sessions/world state, Backpack/Bag/Keyring position whitelist and exact source/destination state immediately before execution;
+- `ITEM_MOVE_V1` executes one native `Player::SwapItem` call, rereads both positions and reports success only when the authoritative state actually changed; it does not use `SplitItem`, `HandleCommand`, `DoSpecificAction` or a generic chat executor;
+- `ITEM_EQUIP_V1` accepts only an exact Backpack/Bag 1..4 source identity (`bag`, `slot`, `itemId`, `count`), applies the same bounded requester protections as the exact inventory mutation family, invokes the native AzerothCore auto-equip path and reports success only after authoritative postcondition validation;
+- `ITEM_UNEQUIP_V1` accepts only an exact equipment slot `0..18` plus positive `itemId`, revalidates Playerbots security, requester/bot sessions, world/alive state and source identity, and captures the source GUID before execution;
+- `ITEM_UNEQUIP_V1` is rate-limited to 8 requests per requester per 2-second window, rejects replayed tokens for 10 seconds, keeps at most 32 recent tokens per requester and bounds requester unequip state to 512 entries;
+- `ITEM_UNEQUIP_V1` uses `CMSG_AUTOSTORE_BAG_ITEM` through the native AzerothCore session handler and reports success only when the same GUID is found outside equipment in an allowed Backpack/Bag 1..4 position; it does not call Playerbots `UnequipAction`, `HandleCommand`, `DoSpecificAction` or a generic chat executor;
 - Group Roll item links are bounded to 160 characters and must contain a valid item-link marker before execution;
 - Group Roll requests are rate-limited per requester (4 requests per 2-second window in the current implementation), and execution is restricted to bridge-visible bots in the requester's actual party/raid with Playerbots security revalidation.
 - Enchant Trade list/run requests are rate-limited per requester (4 requests per 2-second window), require an exact controllable bot name and token, and accept only a positive numeric spell ID for execution.
@@ -463,7 +487,39 @@ should not be assumed to be generically fragmented by this capability.
   </tr>
   <tr>
     <td><code>GET~INVENTORY</code> / <code>INVENTORY_V1</code></td>
-    <td>Refresh inventory data natively through the bridge with item links and icons.</td>
+    <td>Refresh the established native inventory listing through the bridge with item links and icons.</td>
+  </tr>
+  <tr>
+    <td><code>GET~INVENTORY_EXACT</code> / <code>INVENTORY_EXACT_V1</code></td>
+    <td>Expose the bot's exact physical inventory topology for Backpack, equipped Bag 1..4 and Keyring, including container geometry, empty slots and item positions used by the bag-aware addon UI.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_MOVE</code> / <code>ITEM_MOVE_V1</code></td>
+    <td>Move one whole stack between allowed physical inventory positions after strict server-side revalidation, using one native <code>Player::SwapItem</code> call followed by authoritative source/destination rereads and a structured <code>INVENTORY_ITEM_MOVE</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_EQUIP</code> / <code>ITEM_EQUIP_V1</code></td>
+    <td>Equip one exact item from Backpack or equipped Bag 1..4 after server-side source identity and runtime revalidation, using the native AzerothCore auto-equip path and a structured <code>INVENTORY_ITEM_EQUIP</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_UNEQUIP</code> / <code>ITEM_UNEQUIP_V1</code></td>
+    <td>Unequip one exact equipment slot/item identity through the native AzerothCore auto-store path, validate the same item GUID in an allowed inventory position after execution and return a structured <code>INVENTORY_ITEM_UNEQUIP</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_USE</code> / <code>ITEM_USE_V1</code></td>
+    <td>Use one item from an exact physical inventory source after server-side identity/runtime revalidation, execute through the native use-item handler and return a structured <code>INVENTORY_ITEM_USE</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_DESTROY</code> / <code>ITEM_DESTROY_V1</code></td>
+    <td>Destroy one exact item through a specialized endpoint after server-side source identity and runtime revalidation; no generic Playerbots command executor is used.</td>
+  </tr>
+  <tr>
+    <td><code>RUN~ITEM_SELL</code> / <code>ITEM_SELL_SINGLE_V1</code></td>
+    <td>Sell one exact item after revalidating source identity, nearby vendor interaction and protected-item rules, then return a structured <code>INVENTORY_ITEM_SELL</code> result.</td>
+  </tr>
+  <tr>
+    <td><code>VENDOR_BUYBACK_V1</code></td>
+    <td>Expose Buyback through structured <code>BUYBACK_BEGIN</code>/<code>BUYBACK_ITEM</code>/<code>BUYBACK_END</code>/<code>BUYBACK_RESULT</code> messages, bounded nearby-vendor validation and the native Buyback handler.</td>
   </tr>
   <tr>
     <td><code>RUN~ITEM_ACTION</code> — <code>SELL_VENDOR</code> / <code>SELL_GREY</code></td>
@@ -623,16 +679,13 @@ The endpoint and switching implementation remain present, while the project's fi
 
 # Current Development Baseline
 
-Documentation synchronized on **2026-08-14** against:
+Documentation synchronized on **2026-08-17** against the validated Jellypowered bridge-first inventory work and pre-merge stabilization state.
 
-- addon `main`: `106074c3c93f80812f73af27e746860c7c8a4dcf` (PR #61, Group Roll UI);
-- bridge `main`: `210bd1f4f6597fe4f0691ec729ec4904ebe2d463` (PR #26, Group Roll support).
+Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1`, the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service, `INVENTORY_EXACT_V1`, `ITEM_MOVE_V1`, `ITEM_EQUIP_V1`, `ITEM_UNEQUIP_V1`, `ITEM_USE_V1`, the specialized `ITEM_DESTROY` path, `ITEM_SELL_SINGLE_V1` and `VENDOR_BUYBACK_V1`.
 
-Recent bridge-first milestones include `OUTFIT_V1`, `INVENTORY_V1`, hardened bank/guild-bank/vendor-buy item actions, `INVENTORY_BULK_SELL_V1`, `INVENTORY_OPEN_V1`, `GROUP_ROLL_V1` and the runtime-validated `ENCHANT_TRADE_V1` Enchanting Trade Service.
+`INVENTORY_EXACT_V1` exposes exact Backpack, equipped-bag and Keyring topology for the bag-aware addon UI. Exact move/equip/unequip/use/single-sell and Buyback flows revalidate server-side state and wait for structured authoritative results; no generic Playerbots command/chat executor is exposed. Pre-merge stabilization has also closed CAPS wire-budget handling, whole-stack move and quest-start use postconditions, explicit INVENTORY_EXACT authorization, Equip fallback gating, inventory frame recycling, cold-cache safety, ITEM_USE/Inspect localization, the Buyback nil-frame guard and the unused `BUYBACK_ROWS` LuaLint warning. Global LuaLint/CI checks still remain to be executed before merge.
 
-The current PR candidate adds `ENCHANT_TRADE_V1` on top of the Group Roll main baseline. Runtime validation on 2026-08-14 confirmed known-enchant listing, native Trade-slot execution and a real item enchant with no generic cast/chat executor.
-
-The next normal roadmap item is **item-specific loot-rule add/remove**. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
+The next normal roadmap item remains **item-specific loot-rule add/remove**. Deferred work that must not interrupt that sequence includes the SELL_GREY/core-API follow-up and final Firestone/Spellstone TEMP_ENCHANT revalidation.
 
 
 ---
@@ -856,3 +909,39 @@ Thanks to the Playerbots team and the AzerothCore community.
 </a>
 
 </div>
+
+---
+
+## SELF_BOT_V1
+
+`SELF_BOT_V1` provides a specialized bridge-first control for the Playerbots
+self-bot mode used by the MultiBot SelfBot roster button.
+
+State query:
+
+```text
+Addon  -> Server: MBOT GET~SELF_BOT~<token>
+Server -> Addon:  MBOT SELF_BOT_STATE~<token>~<OK|ERR>~<0|1>~<reason>
+```
+
+State mutation:
+
+```text
+Addon  -> Server: MBOT RUN~SELF_BOT~<token>~ENABLE
+Addon  -> Server: MBOT RUN~SELF_BOT~<token>~DISABLE
+Server -> Addon:  MBOT SELF_BOT_RESULT~<token>~<OK|ERR>~<0|1>~<reason>
+```
+
+The operation uses an explicit desired state, so repeated valid requests are
+idempotent. The bridge never accepts an arbitrary Playerbots command for this
+endpoint. It invokes only the audited native
+`HandlePlayerbotCommand("self", requester)` path, then verifies the resulting
+`IsSelfBot(requester)` state.
+
+Activation mirrors the Playerbots `AiPlayerbot.SelfBotLevel` / GM restriction,
+rejects conflicting non-self PlayerbotAI state, and all SELF_BOT requests use a
+bounded per-requester rate limit.
+
+The addon updates the SelfBot button from structured server responses. The
+historical `.playerbot bot self` chat command is used only when
+`MultiBot.allowLegacyChatFallback == true`.
